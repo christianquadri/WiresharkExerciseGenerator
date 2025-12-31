@@ -15,7 +15,7 @@ flow_list:
         fast_retx: True
         mss: 250
         app_bytes_to_send: 5000
-        init_server_window: 1000
+        init_server_window: 3000
         app_read_rate_server: 10000
   # SECOND EXAMPLE
   - flow_template:
@@ -27,7 +27,7 @@ flow_list:
         client_port: 30000        # if flows_to_generate > 1, client ports will be drawn from a range
         server_ip: "10.0.0.20"
         server_port: 22         # if flows_to_generate > 1, server ports will be drawn from a range
-        enable_sack: False
+        enable_sack: True
         loss_prob_c2s: 0.25
         fast_retx: True
         mss: 536

@@ -4,20 +4,22 @@ import math
 import struct
 from typing import Iterable
 
-from scapy.all import wrpcap
+import uuid
+
 from scapy.layers.inet import IP, TCP
 from scapy.packet import Raw
 
 from collections import deque
 from dataclasses import dataclass
 
-from exercises.http_exercise import simple_http_single_req_resp
 from exercises.utils import ensure_params
-from exercises.utils.common_utils import random_high_port, random_well_known_port, make_random_client_ip, \
+from exercises.utils.common_utils import random_high_port, make_random_client_ip, \
     make_random_server_ip, random_port
 
+from exercises.utils.solutions import solutions
+
 logger = logging.getLogger("TCPSIM")
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO)
 # ============================================================
 #  Endpoint-level state: TX/RX FIFOs, ACK & SACK logic
 # ============================================================
@@ -403,7 +405,9 @@ class TCPConnectionSim:
                  # NEW: zero-window probe behaviour
                  zwp_interval=0.2, max_zwp=5,
                  # NEW: MSS (used by application-level send helpers)
-                 mss=1460):
+                 mss=1460,
+                 # RTO fixed, not estimated
+                 rto_timer = 0.5):
 
         """
         mss: Maximum Segment Size used by the new application-level
@@ -458,6 +462,7 @@ class TCPConnectionSim:
         self.fast_retx = bool(fast_retx)
         self.flush_before_close = bool(flush_before_close)
         self.flush_max_rounds = int(flush_max_rounds)
+        self.rto_timer = float(rto_timer)
 
         # MSS (single value, used in both directions by the "app write" helpers)
         self.mss_c2s = int(mss)
@@ -466,6 +471,9 @@ class TCPConnectionSim:
         # Zero-window probe configuration
         self.zwp_interval = float(zwp_interval)
         self.max_zwp = int(max_zwp)
+
+        # used to solutions
+        self.conn_id = str(uuid.uuid4())
 
     # --------------------------------------------------------
     # Time helpers
@@ -580,8 +588,11 @@ class TCPConnectionSim:
                 if candidate is not None:
                     if isinstance(candidate, Iterable):
                         for seg in candidate:
+                            solutions.write(self.conn_id, f"\tTime: {self.time} - SACK retransmit: {seg.seq - tx.isn }")
                             self._fast_retransmit(tx, rx, seg, ack_dir)
                     else:
+                        solutions.write(self.conn_id,
+                                        f"\tTime: {self.time} - Fast retransmit: {candidate.seq - tx.isn}")
                         self._fast_retransmit(tx, rx, candidate, ack_dir)
 
         return ack_pkt
@@ -604,6 +615,15 @@ class TCPConnectionSim:
             data=sent_seg.payload, flags="PA", auto_ack=True,
             seq_override=sent_seg.seq,
         )
+
+    def _check_and_handle_RTO_segments(self, sender: TCPEndpointState):
+        segments = sender.get_unacked_segments()
+        segments = filter(lambda s: self.time - s.time  >= self.rto_timer, segments)
+        segments = sorted(list(segments), key=lambda s: s.seq)
+
+        if len(segments) > 0:
+            return segments[0]
+        return None
 
     # --------------------------------------------------------
     # Flow-control helper
@@ -682,6 +702,11 @@ class TCPConnectionSim:
                 seq=seq, payload_bytes=data_bytes,
                 ack_dir=ack_dir, auto_ack=auto_ack,
             )
+
+        # for solutions
+        if not pkt._delivered:
+            solutions.write(self.conn_id,
+                            f"\tTime: {self.time} - Segment lost: {pkt.seq - self.client.isn}")
 
         return pkt, ack_pkt
 
@@ -805,16 +830,30 @@ class TCPConnectionSim:
         results = []
 
         while remaining > 0:
-            seg_len = min(self.mss_c2s, remaining)
-            payload = self._build_app_payload(seg_len, pattern_byte)
+            rto_segment = self._check_and_handle_RTO_segments(self.client)
+            if rto_segment is not None:
+                # RTO retransmission detected -> retransmit on the client side: FORCED no data loss!!
+                orig_c2s = self.loss_prob_c2s
+                self.loss_prob_c2s = 0.0
+                logger.info(f"RTO segment detected: {rto_segment.seq - self.client.isn} ({self.time}) server window size {self.server.window}")
+                solutions.write(self.conn_id, f"\tTime: {self.time} - RTO retransmission - segment seq: {rto_segment.seq - self.client.isn}")
+                pkt, ack = self.client_retransmit(seq= rto_segment.seq, data= rto_segment.payload)
+                self.loss_prob_c2s = orig_c2s   # restore original loss probability
+                results.append((pkt, ack))
+                continue
+            else:
+                seg_len = min(self.mss_c2s, remaining, self.server.window)
+                payload = self._build_app_payload(seg_len, pattern_byte)
+                pkt, ack = self.send_from_client(payload, auto_ack=auto_ack)
+                seg_len = len(pkt['TCP'].payload) if pkt is not None else 0
+                #print(seg_len,  len(pkt.payload))
 
-            pkt, ack = self.send_from_client(payload, auto_ack=auto_ack)
             results.append((pkt, ack))
 
             if pkt is None:
                 # Blocked by flow control (likely server.window == 0)
                 logger.debug(f"Blocked by flow control server.window = {self.server.window}")
-                if use_probes and self.server.window <= 1:
+                if use_probes and (self.server.window <= 1):  #or self._bytes_in_flight(self.client)>0
                     self._handle_zero_window_block(
                         sender=self.client,
                         receiver=self.server,
@@ -825,13 +864,29 @@ class TCPConnectionSim:
                     # If the server window opened, try again (do not
                     # decrease 'remaining' yet).
                     if self.server.window > 0:
-                        logger.debug("Resuming send after ZWP")
+                        logger.debug(f"Resuming send after ZWP {self.time}")
                         continue
                 # Still blocked or probes disabled -> stop here
-                    break
-            logger.debug(f'Remaining {remaining} {self.time}')
-            # Successfully sent seg_len bytes of new data
-            remaining -= seg_len
+                    #break
+            else:
+                logger.info(f'Remaining {remaining} {self.time} - Sent {pkt.seq - self.client.isn} - len {seg_len} - Acked {ack is not None}')
+                # Successfully sent seg_len bytes of new data
+                remaining -= seg_len
+
+
+        while len(self.client.get_unacked_segments())> 0:
+            self.time = round(self.time + 0.1, 3)
+
+            rto_segment = self._check_and_handle_RTO_segments(self.client)
+            if rto_segment is not None:
+                self.loss_prob_c2s = 0.0
+                logger.info(
+                    f"RTO segment detected: {rto_segment.seq - self.client.isn} ({self.time}) server window size {self.server.window}")
+                solutions.write(self.conn_id,
+                                f"\tTime: {self.time} - RTO retransmission - segment seq: {rto_segment.seq - self.client.isn}")
+                pkt, ack = self.client_retransmit(seq=rto_segment.seq, data=rto_segment.payload)
+                results.append((pkt, ack))
+
 
         return results
 
@@ -1018,8 +1073,12 @@ class TCPConnectionSim:
 
         self.state = "CLOSED"
 
-
-
+        
+########################################################################################################################
+########################################################################################################################
+########################################################################################################################
+########################################################################################################################
+########################################################################################################################
 @ensure_params(param_name='flow_parameters',
                required=['mss','loss_prob_c2s',
                          "app_bytes_to_send",
@@ -1051,114 +1110,23 @@ def tcp_client_server_flow_generator(flow_parameters):
         recv_capacity_server=flow_parameters.get('init_server_window', 65535),
         app_read_rate_server=flow_parameters['app_read_rate_server'],
     )
+
+    solutions.write(conn.conn_id, "Protocol: TCP")
+    solutions.write(conn.conn_id, f"Client: {flow_parameters['client_ip']}:{flow_parameters['client_port']}")
+    solutions.write(conn.conn_id, f"Server: {flow_parameters['server_ip']}:{flow_parameters['server_port']}")
+
+    conn_params_solution_line = f"Connection params:\n"\
+                                f"\tMSS: {flow_parameters['mss']}\n"\
+                                f"\tServer Window Size: {conn.server.window}"
+    if conn.enable_sack:
+        conn_params_solution_line+=" \n\tSACK enabled"
+    solutions.write(conn.conn_id, conn_params_solution_line)
+    solutions.write(conn.conn_id, f"Client application bytes to send: {flow_parameters['app_bytes_to_send']}")
+
+    solutions.write(conn.conn_id, f"Events:")
+
+
     conn.open_connection()
     conn.client_send_app_data(num_bytes=flow_parameters['app_bytes_to_send'])
     conn.close_by_client()
     return conn.packets
-
-
-# -------------------------------------------------------------------
-# The rest of the scenario_* functions can remain as in your file.
-# They do not need changes to benefit from:
-#  - SACK-aware fast retransmit
-#  - Optional MSS + app-level segmentation helpers
-#  - Basic flow-control
-# -------------------------------------------------------------------
-
-# if __name__ == "__main__":
-#     # Common random seed for reproducibility
-#     seed = 108
-#     seed = 42
-#
-#     # With fast retransmit
-#     conn_fast = TCPConnectionSim(
-#         client_ip="192.168.0.10",
-#         client_port=40000,
-#         server_ip="10.0.0.20",
-#         server_port=8080,
-#         enable_sack=False,
-#         loss_prob_c2s=0.25,
-#         loss_prob_s2c=0.0,
-#         fast_retx=True,
-#         rng_seed=seed,
-#         ack_every_n_c2s=1,
-#         flush_before_close=True,
-#         mss=500
-#     )
-#     conn_fast.open_connection()
-#
-#     conn_fast.client_send_app_data(num_bytes=10_000 )
-#     conn_fast.close_by_client()
-#
-#     from scapy.all import wrpcap
-#
-#     wrpcap("../pcap_output/fast_retx_on_off_v3.pcap", conn_fast.packets)
-#
-#     # With fast SACK
-#     conn_sack = TCPConnectionSim(
-#         client_ip="192.168.0.10",
-#         client_port=53400,
-#         server_ip="10.0.0.20",
-#         server_port=8081,
-#         enable_sack=True,
-#         loss_prob_c2s=0.25,
-#         loss_prob_s2c=0.0,
-#         fast_retx=True,
-#         rng_seed=seed,
-#         ack_every_n_c2s=1,
-#         flush_before_close=True,
-#         mss=250
-#     )
-#     conn_sack.open_connection()
-#
-#     conn_sack.client_send_app_data(num_bytes=10_000)
-#     conn_sack.close_by_client()
-#
-#     wrpcap("../pcap_output/sack_v3.pcap", conn_sack.packets)
-#
-#     # With fast SACK
-#     conn_win = TCPConnectionSim(
-#         client_ip="192.168.0.10",
-#         client_port=40000,
-#         server_ip="10.0.0.20",
-#         server_port=8080,
-#         enable_sack=True,
-#         loss_prob_c2s=0.25,
-#         loss_prob_s2c=0.0,
-#         fast_retx=True,
-#         rng_seed=seed,
-#         ack_every_n_c2s=1,
-#         flush_before_close=True,
-#         max_zwp=10,
-#         mss=250,
-#         zwp_interval=0.01,
-#         init_server_window=1000,
-#         recv_capacity_server=1000,
-#         app_read_rate_server=1000
-#     )
-#     conn_win.open_connection()
-#
-#     conn_win.client_send_app_data(num_bytes=10_000)
-#     conn_win.close_by_client()
-#
-#     wrpcap("../pcap_output/window_v3.pcap", conn_win.packets)
-#
-#
-#     http1 = simple_http_single_req_resp(random.randint(0,1000), mss=2000, ip_frag=True, ip_fragsize=512, http_body_size=5_000)
-#     http2 = simple_http_single_req_resp(random.randint(0,1000), mss=150, ip_frag=True, ip_fragsize=224, http_body_size=15_000)
-#     http3 = simple_http_single_req_resp(random.randint(0,1000), mss=1540, ip_frag=True, ip_fragsize=400, http_body_size=5_000)
-#
-#
-#     all_pkts = []
-#     for conn in [conn_fast, conn_sack]:
-#         time_shift = 0
-#         for p in sorted(conn.packets, key=lambda p: p.time):
-#             time_shift += 0.001 + round(random.expovariate(1/0.01),3)
-#             p.time += time_shift
-#             all_pkts.append(p)
-#
-#     all_pkts += http1 + http2 + http3
-#
-#
-#     all_pkts = sorted(all_pkts, key=lambda p: p.time)
-#     wrpcap("../pcap_output/all_v3.pcap", all_pkts)

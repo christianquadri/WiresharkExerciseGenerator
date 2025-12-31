@@ -42,6 +42,7 @@ pip-delete-this-directory.txt
 
 
 
-/pcap_output/
+/pcap_output
+/solutions
 
 .DS_Store

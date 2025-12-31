@@ -12,13 +12,12 @@ from exercises.utils.common_utils import filename, sid_to_seed, make_ips_for_stu
 # Exercise 1 – ICMP ping
 # ------------------------------------------------------------
 
-def make_ex1_icmp_ping(student_id):
-    client_ip, server_ip, _, _ = make_ips_for_student(student_id)
+def make_icmp_ping(client_ip, server_ip):
+    #client_ip, server_ip, _, _ = make_ips_for_student(student_id)
 
     pkts = []
 
-    # Use seed so sequence numbers & payloads are stable per student
-    random.seed(sid_to_seed(student_id) + 1)
+    student_id = random.randint(1, 1_000_000)
 
     # A little variety in how many pings:
     count = random.randint(3, 7)
@@ -31,7 +30,8 @@ def make_ex1_icmp_ping(student_id):
         rep = IP(src=server_ip, dst=client_ip) / ICMP(type="echo-reply", id=0x1234, seq=i) / Raw(load=payload_rep)
         pkts.extend([req, rep])
 
-    wrpcap(filename("ex1_icmp_ping", student_id), pkts)
+    return pkts
+    #wrpcap(filename("ex1_icmp_ping", student_id), pkts)
 
 
 # ------------------------------------------------------------
