@@ -1,6 +1,6 @@
 seed: 42
 flow_list:
-  # FIRST EXAMPL
+  # FIRST EXAMPLE
   - flow_template:
       tag: "tcp_c2s_fast_retx"
       flow_generator: "TCP_client_server"  # flow template name (case-insensitive)
@@ -38,7 +38,7 @@ flow_list:
   - flow_template:
       tag: "http_generic"
       flow_generator: "HTTP_request_reply"  # flow template name (case-insensitive)
-      flows_to_generate: 3        # number of flows to generate between the same client and server pair
+      flows_to_generate: 1        # number of flows to generate between the same client and server pair
       flow_parameters:
         client_ip: "192.168.0.10"
         client_port: 40000        # if flows_to_generate > 1, client ports will be drawn from a range [10000, 50000]
@@ -51,12 +51,12 @@ flow_list:
   - flow_template:
       tag: "http_generic_with_IP_frag"
       flow_generator: "HTTP_request_reply"  # flow template name (case-insensitive)
-      flows_to_generate: 3        # number of flows to generate between the same client and server pair
+      flows_to_generate: 1        # number of flows to generate between the same client and server pair
       flow_parameters:
         client_ip: "192.168.0.10"
-        client_port: 40000        # if flows_to_generate > 1, client ports will be drawn from a range
+        client_port: 40002        # if flows_to_generate > 1, client ports will be drawn from a range
         server_ip: "10.0.0.20"
-        server_port: 8080         # if flows_to_generate > 1, server ports will be drawn from a list of well-known ports
+        server_port: 80         # if flows_to_generate > 1, server ports will be drawn from a list of well-known ports
         mss: 1000
         ip_fragsize: 720
         http_body_resp_size: 12500

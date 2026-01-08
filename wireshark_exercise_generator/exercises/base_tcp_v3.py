@@ -12,11 +12,11 @@ from scapy.packet import Raw
 from collections import deque
 from dataclasses import dataclass
 
-from exercises.utils import ensure_params
-from exercises.utils.common_utils import random_high_port, make_random_client_ip, \
+from wireshark_exercise_generator.exercises.utils import ensure_params
+from wireshark_exercise_generator.exercises.utils.common_utils import random_high_port, make_random_client_ip, \
     make_random_server_ip, random_port
 
-from exercises.utils.solutions import solutions
+from wireshark_exercise_generator.exercises.utils.solutions import solutions
 
 logger = logging.getLogger("TCPSIM")
 logging.basicConfig(level=logging.INFO)
@@ -70,7 +70,7 @@ class TCPEndpointState:
         - dup_ack_count
     """
 
-    def __init__(self, ip, port, isn=None, init_window=65535, name="endpoint",
+    def __init__(self, ip, port, isn=None, mss=536, init_window=65535, name="endpoint",
                  rx_ack_every_n=None, rx_ack_timeout=None, start_time=0.0,
                  sack_permitted=False, max_tx_buffer=None, max_rx_buffer=None,
                  recv_capacity=None, app_read_rate=0.0):
@@ -96,6 +96,10 @@ class TCPEndpointState:
         self.app_read_rate = float(app_read_rate) if app_read_rate else 0.0
         self.last_app_read_time = float(start_time)
 
+        self.tx_window_full = False
+        self.tx_window_size = None # Initialize during connection setup
+
+        self.mss = mss
         # ----------------------------------------------------
         # RX
         # ----------------------------------------------------
@@ -148,6 +152,11 @@ class TCPEndpointState:
         logger.debug(f"App read {consumed} bytes from recv buffer")
 
         # Advertised window is "how much free space I have"
+        # if self.window ==0:
+        #     free_space = self.recv_capacity - self.recv_used
+        #     if free_space < min(self.mss, self.recv_capacity//2):
+        #         self.window = 0
+        # else:
         self.window = max(0, self.recv_capacity - self.recv_used)
 
     def force_app_read(self, now, num_bytes=None):
@@ -272,7 +281,9 @@ class TCPEndpointState:
         # Occupy the receive buffer with the newly delivered bytes
         if self.recv_capacity is not None:
             self.recv_used = min(self.recv_capacity, self.recv_used + length)
-            self.window = max(0, self.recv_capacity - self.recv_used)
+            #self.window = max(0, self.recv_capacity - self.recv_used)
+            #buffer_space = max(0, self.recv_capacity - self.recv_used)
+
 
         self.rx_unacked_pkts += 1
         seg_end = seq + length
@@ -299,6 +310,17 @@ class TCPEndpointState:
     def mark_ack_sent(self, now):
         self.rx_unacked_pkts = 0
         self.rx_last_ack_time = float(now)
+
+    def mark_sender_window_full(self, conn_id: str, time):
+        if not self.tx_window_full: # this means that the window was not full before
+            solutions.write_event(conn_id, time = time, solution_line="TX_WINDOW_FULL")
+        self.tx_window_full = True
+
+
+    def mark_sender_window_open(self, conn_id:str, time: float, win_size: int):
+        if self.tx_window_full:
+            solutions.write_event(conn_id, time=time, solution_line=f"TX window open, window size: {win_size}")
+        self.tx_window_full = False
 
     # --------------------------------------------------------
     # SACK application on sender side
@@ -427,6 +449,7 @@ class TCPConnectionSim:
         self.client = TCPEndpointState(
             ip=client_ip, port=client_port,
             isn=isn_client, init_window=init_client_window,
+            mss= int(mss),
             name="client",
             rx_ack_every_n=ack_every_n_s2c,
             rx_ack_timeout=ack_timeout_s2c,
@@ -438,6 +461,7 @@ class TCPConnectionSim:
         self.server = TCPEndpointState(
             ip=server_ip, port=server_port,
             isn=isn_server, init_window=init_server_window,
+            mss=int(mss),
             name="server",
             rx_ack_every_n=ack_every_n_c2s,
             rx_ack_timeout=ack_timeout_c2s,
@@ -575,10 +599,13 @@ class TCPConnectionSim:
             sack_blocks = rx.get_sack_blocks() if rx.sack_permitted else None
             opts = self._build_ack_options(sack_blocks)
 
+            announced_window = rx.window
+
+            logger.debug(f'({self.time}) Announced window: {announced_window}')
             ack_pkt = self._make_packet(
                 src=rx, dst=tx, flags="A",
                 seq=rx.next_seq, ack=ack_seq,
-                window=rx.window, options=opts,
+                window=announced_window, options=opts,
                 direction=ack_dir,
             )
             rx.mark_ack_sent(self.time)
@@ -588,11 +615,12 @@ class TCPConnectionSim:
                 if candidate is not None:
                     if isinstance(candidate, Iterable):
                         for seg in candidate:
-                            solutions.write(self.conn_id, f"\tTime: {self.time} - SACK retransmit: {seg.seq - tx.isn }")
+                            solutions.write_event(self.conn_id, time = self.time,
+                                                  solution_line=f"SACK retransmit: {seg.seq - tx.isn }")
                             self._fast_retransmit(tx, rx, seg, ack_dir)
                     else:
-                        solutions.write(self.conn_id,
-                                        f"\tTime: {self.time} - Fast retransmit: {candidate.seq - tx.isn}")
+                        solutions.write_event(self.conn_id, time = self.time,
+                                              solution_line= f"Fast retransmit: {candidate.seq - tx.isn}")
                         self._fast_retransmit(tx, rx, candidate, ack_dir)
 
         return ack_pkt
@@ -647,6 +675,9 @@ class TCPConnectionSim:
         data_bytes = data if isinstance(data, (bytes, bytearray)) else data.encode()
         length = len(data_bytes)
 
+        # Time advances for this transmission attempt
+        self._advance_time_exp(rate)
+
         # ----------------------------------------------------
         # Sender-side flow control based on dst.window.
         # Applied only for NEW data (seq_override is None).
@@ -656,7 +687,8 @@ class TCPConnectionSim:
         # ----------------------------------------------------
         if seq_override is None and dst.window is not None:
             in_flight = self._bytes_in_flight(src)
-            allowed = dst.window - in_flight
+            #allowed = dst.window - in_flight
+            allowed = src.tx_window_size - in_flight
 
             if allowed <= 0:
                 # Allow a 1-byte probe even if window == 0
@@ -674,8 +706,8 @@ class TCPConnectionSim:
                 data_bytes = data_bytes[:allowed]
                 length = len(data_bytes)
 
-        # Time advances for this transmission attempt
-        self._advance_time_exp(rate)
+            if length == allowed:
+                self.client.mark_sender_window_full(conn_id=self.conn_id, time=self.time)
 
         seq = src.next_seq if seq_override is None else seq_override
         ack_val = src.next_ack
@@ -702,11 +734,13 @@ class TCPConnectionSim:
                 seq=seq, payload_bytes=data_bytes,
                 ack_dir=ack_dir, auto_ack=auto_ack,
             )
+            if ack_pkt.window >0:
+                self.client.mark_sender_window_open(self.conn_id, self.time, ack_pkt.window)
 
         # for solutions
         if not pkt._delivered:
-            solutions.write(self.conn_id,
-                            f"\tTime: {self.time} - Segment lost: {pkt.seq - self.client.isn}")
+            solutions.write_event(self.conn_id, time= self.time,
+                                  solution_line=f"Segment lost: {pkt.seq - self.client.isn}")
 
         return pkt, ack_pkt
 
@@ -791,6 +825,10 @@ class TCPConnectionSim:
             c.sack_permitted = True
             s.sack_permitted = True
 
+        # setup windows announced size
+        c.tx_window_size = s.window
+        s.rx_window_size = c.window
+
         self.state = "ESTABLISHED"
 
     # --------------------------------------------------------
@@ -835,14 +873,15 @@ class TCPConnectionSim:
                 # RTO retransmission detected -> retransmit on the client side: FORCED no data loss!!
                 orig_c2s = self.loss_prob_c2s
                 self.loss_prob_c2s = 0.0
-                logger.info(f"RTO segment detected: {rto_segment.seq - self.client.isn} ({self.time}) server window size {self.server.window}")
-                solutions.write(self.conn_id, f"\tTime: {self.time} - RTO retransmission - segment seq: {rto_segment.seq - self.client.isn}")
+                logger.debug(f"RTO segment detected: {rto_segment.seq - self.client.isn} ({self.time}) server window size {self.server.window}")
                 pkt, ack = self.client_retransmit(seq= rto_segment.seq, data= rto_segment.payload)
+                solutions.write_event(self.conn_id, time= pkt.time,
+                                      solution_line= f"RTO retransmission - segment seq: {rto_segment.seq - self.client.isn}")
                 self.loss_prob_c2s = orig_c2s   # restore original loss probability
                 results.append((pkt, ack))
                 continue
             else:
-                seg_len = min(self.mss_c2s, remaining, self.server.window)
+                seg_len = min(self.mss_c2s, remaining, self.client.tx_window_size)
                 payload = self._build_app_payload(seg_len, pattern_byte)
                 pkt, ack = self.send_from_client(payload, auto_ack=auto_ack)
                 seg_len = len(pkt['TCP'].payload) if pkt is not None else 0
@@ -851,9 +890,10 @@ class TCPConnectionSim:
             results.append((pkt, ack))
 
             if pkt is None:
+                #self.client.mark_sender_window_full(conn_id=self.conn_id, time=self.time)
                 # Blocked by flow control (likely server.window == 0)
-                logger.debug(f"Blocked by flow control server.window = {self.server.window}")
-                if use_probes and (self.server.window <= 1):  #or self._bytes_in_flight(self.client)>0
+                #logger.info(f"Blocked by flow control server.window = {self.server.window}")
+                if use_probes and (self.client.tx_window_size <= 1):  #or self._bytes_in_flight(self.client)>0
                     self._handle_zero_window_block(
                         sender=self.client,
                         receiver=self.server,
@@ -869,7 +909,10 @@ class TCPConnectionSim:
                 # Still blocked or probes disabled -> stop here
                     #break
             else:
-                logger.info(f'Remaining {remaining} {self.time} - Sent {pkt.seq - self.client.isn} - len {seg_len} - Acked {ack is not None}')
+                if ack is not None and ack.window >0:
+                    self.client.tx_window_size = ack.window
+                    self.client.mark_sender_window_open(conn_id=self.conn_id, time= self.time, win_size=ack.window)
+                logger.debug(f'Remaining {remaining} {self.time} - Sent {pkt.seq - self.client.isn} - len {seg_len} - Acked {ack is not None}')
                 # Successfully sent seg_len bytes of new data
                 remaining -= seg_len
 
@@ -880,10 +923,10 @@ class TCPConnectionSim:
             rto_segment = self._check_and_handle_RTO_segments(self.client)
             if rto_segment is not None:
                 self.loss_prob_c2s = 0.0
-                logger.info(
+                logger.debug(
                     f"RTO segment detected: {rto_segment.seq - self.client.isn} ({self.time}) server window size {self.server.window}")
-                solutions.write(self.conn_id,
-                                f"\tTime: {self.time} - RTO retransmission - segment seq: {rto_segment.seq - self.client.isn}")
+                solutions.write_event(self.conn_id, time= self.time,
+                                      solution_line= f"RTO retransmission - segment seq: {rto_segment.seq - self.client.isn}")
                 pkt, ack = self.client_retransmit(seq=rto_segment.seq, data=rto_segment.payload)
                 results.append((pkt, ack))
 
@@ -895,7 +938,7 @@ class TCPConnectionSim:
                              auto_ack=True,
                              use_probes=True):
         """
-        Mirror of client_send_app_data for server -> client direction.
+        Mirror of client_send_app_data for server -> client direction. (NOT USED IN EXERCISES)
         """
         if self.state != "ESTABLISHED":
             raise RuntimeError("Connection not established")
@@ -1034,7 +1077,6 @@ class TCPConnectionSim:
         # Optional: flush outstanding client->server data
         self._flush_unacked(sender=c, receiver=s,
                             direction="c2s", ack_dir="s2c")
-        print("="*50)
         self._set_time(self.time + self.fin_gap)
         self._make_packet(c, s, "FA", c.next_seq, c.next_ack,
                           window=c.window)
@@ -1086,7 +1128,7 @@ class TCPConnectionSim:
                          'client_port', 'server_port',
                          "app_read_rate_server"],
                generators={
-                   'http_body_size': lambda: random.randint(1000, 10_000),
+                   'app_bytes_to_send': lambda: random.randint(1000, 10_000),
                    'client_port': random_high_port,
                    'server_port': random_port,
                    'client_ip': make_random_client_ip,
@@ -1109,6 +1151,7 @@ def tcp_client_server_flow_generator(flow_parameters):
         init_server_window=flow_parameters.get('init_server_window', 65535),
         recv_capacity_server=flow_parameters.get('init_server_window', 65535),
         app_read_rate_server=flow_parameters['app_read_rate_server'],
+        rto_timer=flow_parameters.get('rto_timer', 1),
     )
 
     solutions.write(conn.conn_id, "Protocol: TCP")
@@ -1121,9 +1164,8 @@ def tcp_client_server_flow_generator(flow_parameters):
     if conn.enable_sack:
         conn_params_solution_line+=" \n\tSACK enabled"
     solutions.write(conn.conn_id, conn_params_solution_line)
-    solutions.write(conn.conn_id, f"Client application bytes to send: {flow_parameters['app_bytes_to_send']}")
+    solutions.write(conn.conn_id, f"Client application bytes to send: {flow_parameters['app_bytes_to_send']} Bytes")
 
-    solutions.write(conn.conn_id, f"Events:")
 
 
     conn.open_connection()

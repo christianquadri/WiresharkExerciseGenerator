@@ -41,8 +41,6 @@ pip-delete-this-directory.txt
 .idea/
 
 
-
-/pcap_output
-/solutions
+/out
 
 .DS_Store

@@ -1,14 +1,18 @@
 import logging
 
-from exercises.base_tcp_v3 import tcp_client_server_flow_generator
-from exercises.http_exercise import http_flow_generator
+from wireshark_exercise_generator.exercises.base_tcp_v3 import tcp_client_server_flow_generator
+from wireshark_exercise_generator.exercises.http_exercise import http_flow_generator
 
 
 
 
 _flow_template_to_generator = {'http_request_reply': http_flow_generator,
-                               'tcp_client_server': tcp_client_server_flow_generator,
-                               'ping': None}
+                               'tcp_client_server': tcp_client_server_flow_generator}
+                               #'ping': None}
+
+def get_flow_generator_options():
+    return list(_flow_template_to_generator.keys())
+
 
 def flow_generator(flow_gen_id, flow_template_params):
     # Check that the flow generator exists

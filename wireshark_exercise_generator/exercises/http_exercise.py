@@ -1,11 +1,12 @@
 from scapy.all import *
 from scapy.layers.inet import IP, TCP, fragment
 
-from exercises.utils import ensure_params
-from exercises.utils.common_utils import make_ips_for_student, sid_to_seed, random_high_port, filename, \
+from wireshark_exercise_generator.exercises.utils import ensure_params
+from wireshark_exercise_generator.exercises.utils.common_utils import make_ips_for_student, sid_to_seed, random_high_port, filename, \
     random_well_known_port, make_random_client_ip, make_random_server_ip
-from exercises.utils.tcp_utils import tcp_segment
+from wireshark_exercise_generator.exercises.utils.tcp_utils import tcp_segment
 
+from wireshark_exercise_generator.exercises.utils.solutions import solutions
 
 
 def simple_http_single_req_resp(client_ip,
@@ -35,7 +36,21 @@ def simple_http_single_req_resp(client_ip,
     #client_ip, server_ip, _, _ = make_ips_for_student(student_id)
 
     # Seed RNG so each student has stable HTTP size & ports
-    #random.seed(sid_to_seed(student_id) + 2)
+    exercise_id  = str(uuid.uuid4())    # used for solutions
+
+    ###### SOLUTIONS ######
+    solutions.write(exercise_id, "Protocol: HTTP")
+    solutions.write(exercise_id, f"Client: {client_ip}:{client_port}")
+    solutions.write(exercise_id, f"Server: {server_ip}:{server_port}")
+
+    conn_params_solution_line = f"Connection params:\n" \
+                                f"\tMSS: {mss}\n" \
+                                f"\tIP Fragment size: {ip_fragsize if ip_fragsize < mss else "No IP fragmentation required (mss > MTU)"}"
+    solutions.write(exercise_id, conn_params_solution_line)
+    solutions.write(exercise_id, f"Server response body size: {http_body_resp_size} Bytes")
+    #######################
+
+
     student_id = random.randint(1, 1_000_000)
 
     delta_time_func = lambda: round( random.expovariate(1/packet_tx_time_mean) ,3)
