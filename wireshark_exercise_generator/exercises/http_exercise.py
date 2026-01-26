@@ -45,7 +45,7 @@ def simple_http_single_req_resp(client_ip,
 
     conn_params_solution_line = f"Connection params:\n" \
                                 f"\tMSS: {mss}\n" \
-                                f"\tIP Fragment size: {ip_fragsize if ip_fragsize < mss else "No IP fragmentation required (mss > MTU)"}"
+                                f"\tIP Fragment size: {ip_fragsize if ip_fragsize < mss else "No IP fragmentation required (mss < MTU)"}"
     solutions.write(exercise_id, conn_params_solution_line)
     #######################
 
