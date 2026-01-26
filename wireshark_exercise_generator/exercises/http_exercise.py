@@ -47,7 +47,6 @@ def simple_http_single_req_resp(client_ip,
                                 f"\tMSS: {mss}\n" \
                                 f"\tIP Fragment size: {ip_fragsize if ip_fragsize < mss else "No IP fragmentation required (mss > MTU)"}"
     solutions.write(exercise_id, conn_params_solution_line)
-    solutions.write(exercise_id, f"Server response body size: {http_body_resp_size} Bytes")
     #######################
 
 
@@ -115,11 +114,13 @@ def simple_http_single_req_resp(client_ip,
     # Large HTTP response body
     # -----------------------------
     # Body size per student (KB): deterministic but varied
-    body_size_kb = random.choice([5, 50, 200])   # 5 KB, 50 KB, 200 KB
-    body_size = body_size_kb * 1024              # bytes
+    #body_size_kb = random.choice([5, 50, 200])   # 5 KB, 50 KB, 200 KB
+    body_size = http_body_resp_size #body_size_kb * 1024              # bytes
 
     pattern = (f"B".encode()) * http_body_resp_size
     body = pattern[:body_size]
+
+    solutions.write(exercise_id, f"Server response body size: {body_size} Bytes")
 
     headers = (
         "HTTP/1.1 200 OK\r\n"
